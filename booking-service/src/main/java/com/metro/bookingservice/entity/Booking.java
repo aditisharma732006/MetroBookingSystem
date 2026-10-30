@@ -38,6 +38,7 @@ public class Booking {
     private String fromStationName; // frozen — for display, survives renames/deletion
     private String toStationName;
 
+    @Column(precision = 10, scale = 2)
     private BigDecimal fare;       // frozen — what was actually paid
     private double distanceKm; // frozen — trip fact at that time
 

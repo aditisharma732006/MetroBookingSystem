@@ -33,7 +33,8 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
             "/v3/api-docs",
             "/auth-service/v3/api-docs",
             "/station-service/v3/api-docs",
-            "/booking-service/v3/api-docs"   // NEW
+            "/booking-service/v3/api-docs" ,  // NEW
+            "/payment-service/v3/api-docs"
     );
 
     private static final List<String> ADMIN_ONLY_PATHS = List.of(
