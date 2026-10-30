@@ -7,19 +7,20 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 import com.metro.paymentservice.entity.Payment;
 import com.metro.paymentservice.entity.PaymentStatus;
-
-import jakarta.transaction.Transactional;
 
 public interface PaymentRepository extends JpaRepository<Payment, Long> {
 
     boolean existsByBookingId(Long bookingId);
 
-    Optional<Payment> findByBookingId(Long bookingId);          // no annotations
+    Optional<Payment> findByBookingId(Long bookingId);
 
-    Optional<Payment> findByRazorpayOrderId(String razorpayOrderId);   // no annotations
+    Optional<Payment> findByRazorpayOrderId(String razorpayOrderId);
+
+    List<Payment> findByStatusAndEventPublishedFalse(PaymentStatus status);
 
     @Modifying(clearAutomatically = true)
     @Transactional
@@ -35,11 +36,17 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
                    @Param("paymentId") String paymentId,
                    @Param("oldStatus") PaymentStatus oldStatus,
                    @Param("newStatus") PaymentStatus newStatus);
-    
-    List<Payment> findByStatusAndEventPublishedFalse(PaymentStatus status);
 
     @Modifying(clearAutomatically = true)
     @Transactional
     @Query("UPDATE Payment p SET p.eventPublished = true WHERE p.id = :id")
     int markEventPublished(@Param("id") Long id);
+
+    // status-only compare-and-set, used by the refund flow
+    @Modifying(clearAutomatically = true)
+    @Transactional
+    @Query("UPDATE Payment p SET p.status = :newStatus WHERE p.id = :id AND p.status = :oldStatus")
+    int transition(@Param("id") Long id,
+                   @Param("oldStatus") PaymentStatus oldStatus,
+                   @Param("newStatus") PaymentStatus newStatus);
 }

@@ -3,6 +3,8 @@ package com.metro.bookingservice.service;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
@@ -14,6 +16,8 @@ import com.metro.bookingservice.dto.response.RouteResponseDto;
 import com.metro.bookingservice.entity.Booking;
 import com.metro.bookingservice.entity.BookingStatus;
 import com.metro.bookingservice.event.BookingEventPublisher;
+import com.metro.bookingservice.event.PaymentSuccessEvent;
+import com.metro.bookingservice.event.RefundEventPublisher;
 import com.metro.bookingservice.exception.BookingNotFoundException;
 import com.metro.bookingservice.exception.InvalidBookingRequestException;
 import com.metro.bookingservice.exception.InvalidBookingStatusException;
@@ -25,74 +29,85 @@ import feign.FeignException;
 
 @Service
 public class BookingService {
-	@Autowired
-	public StationServiceClient stationServiceClient;
 
-	@Autowired
-	public BookingRepository bookingRepository;
-	
-	@Autowired
-	private BookingEventPublisher bookingEventPublisher;
-	
-	public BookingResponseDto createBooking(CreateBookingRequestDto request , Long userId) {
-		if (request.getFromStationId().equals(request.getToStationId())) {
-		    throw new InvalidBookingRequestException("Source and destination stations must be different");
-		}
-		RouteResponseDto route;
-		try {
-		    route = stationServiceClient.getRoute(request.getFromStationId(), request.getToStationId());
-		} catch (FeignException e) {
-		    if (e.status() >= 400 && e.status() < 500) {
-		        throw new RouteNotFoundException("No route found for the given stations");
-		    }
-		    throw new StationServiceUnavailableException("Station service is currently unavailable");
-		}
-		
-		Booking booking = new Booking();
-		booking.setUserId(userId);
-		booking.setFromStationId(request.getFromStationId());
-		booking.setToStationId(request.getToStationId());
+    private static final Logger log = LoggerFactory.getLogger(BookingService.class);
+
+    @Autowired
+    public StationServiceClient stationServiceClient;
+
+    @Autowired
+    public BookingRepository bookingRepository;
+
+    @Autowired
+    private BookingEventPublisher bookingEventPublisher;
+
+    @Autowired
+    private RefundEventPublisher refundEventPublisher;
+
+    public BookingResponseDto createBooking(CreateBookingRequestDto request, Long userId) {
+        if (request.getFromStationId().equals(request.getToStationId())) {
+            throw new InvalidBookingRequestException("Source and destination stations must be different");
+        }
+        RouteResponseDto route;
+        try {
+            route = stationServiceClient.getRoute(request.getFromStationId(), request.getToStationId());
+        } catch (FeignException e) {
+            if (e.status() >= 400 && e.status() < 500) {
+                throw new RouteNotFoundException("No route found for the given stations");
+            }
+            throw new StationServiceUnavailableException("Station service is currently unavailable");
+        }
+
+        Booking booking = new Booking();
+        booking.setUserId(userId);
+        booking.setFromStationId(request.getFromStationId());
+        booking.setToStationId(request.getToStationId());
         booking.setFromStationName(extractStationName(route, true));
         booking.setToStationName(extractStationName(route, false));
         booking.setFare(route.getFare());
         booking.setDistanceKm(route.getTotalDistanceKm());
         booking.setStatus(BookingStatus.PENDING);
-        
+
         Booking saved = bookingRepository.save(booking);
-        
+
         bookingEventPublisher.publishBookingCreated(saved);   // after the save, outside any transaction
 
-        
         return toResponseDto(saved);
-	}
-	
-	private String extractStationName(RouteResponseDto route, boolean isFrom) {
-	    if (route.getPath() == null || route.getPath().isEmpty()) {
-	        throw new RouteNotFoundException("Route data is incomplete for the given stations");
-	    }
-	    PathStepDto step = isFrom ? route.getPath().get(0) : route.getPath().get(route.getPath().size() - 1);
-	    return step.getStation().getName();
-	}
-	
-    public BookingResponseDto cancelBooking(Long bookingId , Long userId) {
+    }
+
+    private String extractStationName(RouteResponseDto route, boolean isFrom) {
+        if (route.getPath() == null || route.getPath().isEmpty()) {
+            throw new RouteNotFoundException("Route data is incomplete for the given stations");
+        }
+        PathStepDto step = isFrom ? route.getPath().get(0) : route.getPath().get(route.getPath().size() - 1);
+        return step.getStation().getName();
+    }
+
+    public BookingResponseDto cancelBooking(Long bookingId, Long userId) {
         Booking booking = bookingRepository.findById(bookingId)
                 .orElseThrow(() -> new BookingNotFoundException("Booking not found"));
-        
+
         if (!booking.getUserId().equals(userId)) {
             throw new BookingNotFoundException("Booking not found");
         }
-        
+
         if (booking.getStatus() != BookingStatus.PENDING) {
             throw new InvalidBookingStatusException(
                     "Only PENDING bookings can be cancelled. Current status: " + booking.getStatus());
         }
-        
-        booking.setStatus(BookingStatus.CANCELLED);
-        Booking saved = bookingRepository.save(booking);
-        
-        return toResponseDto(saved);
+
+        // compare-and-set: if the payment consumer confirmed it in the meantime, this changes 0 rows
+        int updated = bookingRepository.updateStatusIfCurrent(
+                bookingId, BookingStatus.PENDING, BookingStatus.CANCELLED);
+        if (updated == 0) {
+            BookingStatus now = bookingRepository.findById(bookingId).orElseThrow().getStatus();
+            throw new InvalidBookingStatusException(
+                    "Only PENDING bookings can be cancelled. Current status: " + now);
+        }
+
+        return toResponseDto(bookingRepository.findById(bookingId).orElseThrow());
     }
-    
+
     public List<BookingResponseDto> getMyBookings(Long userId) {
         List<Booking> bookings = bookingRepository.findByUserIdOrderByCreatedAtDesc(userId);
 
@@ -102,7 +117,61 @@ public class BookingService {
         }
         return result;
     }
-	
+
+    // frontend polls this after payment
+    public BookingResponseDto getBooking(Long bookingId, Long userId) {
+        Booking booking = bookingRepository.findById(bookingId)
+                .orElseThrow(() -> new BookingNotFoundException("Booking not found"));
+        if (!booking.getUserId().equals(userId)) {
+            throw new BookingNotFoundException("Booking not found");
+        }
+        return toResponseDto(booking);
+    }
+
+    // Called by the Kafka consumer. Expected cases (mismatch, duplicate) return quietly
+    // so Kafka does not retry them forever. Real failures (DB/Kafka down) propagate.
+    public void handlePaymentSuccess(PaymentSuccessEvent event) {
+        Booking booking = bookingRepository.findById(event.getBookingId()).orElse(null);
+
+        if (booking == null) {
+            log.error("PaymentSuccess for unknown booking {}", event.getBookingId());
+            return;
+        }
+        if (!booking.getUserId().equals(event.getUserId())
+                || booking.getFare().compareTo(event.getAmount()) != 0) {
+            log.error("PaymentSuccess mismatch for booking {} (user or amount), needs manual review",
+                    booking.getId());
+            return;
+        }
+
+        int confirmed = bookingRepository.updateStatusIfCurrent(
+                booking.getId(), BookingStatus.PENDING, BookingStatus.CONFIRMED);
+        if (confirmed == 1) {
+            log.info("Booking {} confirmed", booking.getId());
+            return;
+        }
+
+        BookingStatus current = bookingRepository.findById(booking.getId()).orElseThrow().getStatus();
+
+        if (current == BookingStatus.CANCELLED || current == BookingStatus.EXPIRED
+                || current == BookingStatus.FAILED) {
+            bookingRepository.updateStatusIfCurrent(
+                    booking.getId(), current, BookingStatus.PAID_AFTER_EXPIRY);
+            current = BookingStatus.PAID_AFTER_EXPIRY;
+        }
+
+        if (current == BookingStatus.PAID_AFTER_EXPIRY) {
+            // published on every delivery; Payment's compare-and-set makes repeats harmless
+            log.warn("Booking {} was dead when payment {} arrived, requesting refund",
+                    booking.getId(), event.getRazorpayPaymentId());
+            refundEventPublisher.publishRefundRequired(booking.getId(), "BOOKING_EXPIRED_AFTER_PAYMENT");
+            return;
+        }
+
+        log.info("Duplicate PaymentSuccess for booking {} (already {}), ignored",
+                booking.getId(), current);
+    }
+
     private BookingResponseDto toResponseDto(Booking booking) {
         BookingResponseDto dto = new BookingResponseDto();
         dto.setId(booking.getId());
@@ -115,7 +184,4 @@ public class BookingService {
         dto.setCreatedAt(booking.getCreatedAt());
         return dto;
     }
-    
-
-    
 }

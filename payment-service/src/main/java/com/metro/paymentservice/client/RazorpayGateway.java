@@ -17,21 +17,21 @@ public class RazorpayGateway {
 
     private final RazorpayClient client;
     private final String keySecret;
+
     public RazorpayGateway(@Value("${razorpay.key-id}") String keyId,
                            @Value("${razorpay.key-secret}") String keySecret) throws RazorpayException {
         this.client = new RazorpayClient(keyId, keySecret);
-        this.keySecret=keySecret;
+        this.keySecret = keySecret;
     }
 
     public String createOrder(Payment payment) {
         try {
-            // Razorpay wants paise. longValueExact() throws if the fare has fractions of a paisa.
             long paise = payment.getAmount().multiply(BigDecimal.valueOf(100)).longValueExact();
 
             JSONObject options = new JSONObject();
             options.put("amount", paise);
             options.put("currency", "INR");
-            options.put("receipt", "booking_" + payment.getBookingId()); // for tracing in the dashboard
+            options.put("receipt", "booking_" + payment.getBookingId());
 
             Order order = client.orders.create(options);
             return order.get("id");
@@ -39,8 +39,6 @@ public class RazorpayGateway {
             throw new PaymentGatewayException("Could not create Razorpay order", e);
         }
     }
-    
-    
 
     public boolean verifySignature(String orderId, String paymentId, String signature) {
         try {
@@ -50,8 +48,26 @@ public class RazorpayGateway {
             attrs.put("razorpay_signature", signature);
             return com.razorpay.Utils.verifyPaymentSignature(attrs, keySecret);
         } catch (RazorpayException e) {
-            return false;   // malformed input counts as invalid
+            return false;
         }
     }
-    
+
+    // Refunds the full amount of a captured payment.
+    public void refund(Payment payment) {
+        try {
+            long paise = payment.getAmount().multiply(BigDecimal.valueOf(100)).longValueExact();
+
+            JSONObject notes = new JSONObject();
+            notes.put("reason", "BOOKING_EXPIRED_AFTER_PAYMENT");
+            notes.put("bookingId", String.valueOf(payment.getBookingId()));
+
+            JSONObject options = new JSONObject();
+            options.put("amount", paise);
+            options.put("notes", notes);
+
+            client.payments.refund(payment.getRazorpayPaymentId(), options);
+        } catch (RazorpayException | ArithmeticException e) {
+            throw new PaymentGatewayException("Could not refund payment", e);
+        }
+    }
 }

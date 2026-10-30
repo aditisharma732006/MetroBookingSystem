@@ -6,5 +6,6 @@ public enum BookingStatus {
     FAILED,
     CANCELLED,
     EXPIRED,
-//    USED  , not adding the gate scan so its no for now 
+    PAID_AFTER_EXPIRY,   // money taken, booking dead, refund requested
+    REFUNDED             // refund accepted by Razorpay; bank credit takes days
 }
